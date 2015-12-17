@@ -10,30 +10,34 @@
  * @version     2.1.0
  */
 
-if ( ! defined( 'ABSPATH' ) ) exit; // Exit if accessed directly
+if ( ! defined( 'ABSPATH' ) ) {
+	exit; // Exit if accessed directly
+}
 
 /**
  * Wrapper for wp_get_post_terms which supports ordering by parent.
  *
- * NOTE: At this point in time, ordering by menu_order for example isn't possible with this function. wp_get_post_terms has no
- *   filters which we can utilise to modify it's query. https://core.trac.wordpress.org/ticket/19094
- * 
+ * NOTE: At this point in time, ordering by menu_order for example isn't possible with this function. wp_get_post_terms has no.
+ *   filters which we can utilise to modify it's query. https://core.trac.wordpress.org/ticket/19094.
+ *
  * @param  int $product_id
  * @param  string $taxonomy
  * @param  array  $args
  * @return array
  */
 function wc_get_product_terms( $product_id, $taxonomy, $args = array() ) {
-	if ( ! taxonomy_exists( $taxonomy ) )
+	if ( ! taxonomy_exists( $taxonomy ) ) {
 		return array();
+	}
 
 	if ( empty( $args['orderby'] ) && taxonomy_is_product_attribute( $taxonomy ) ) {
 		$args['orderby'] = wc_attribute_orderby( $taxonomy );
 	}
 
 	// Support ordering by parent
-	if ( ! empty( $args['orderby'] ) && $args['orderby'] == 'parent' ) {
-		$fields = isset( $args['fields'] ) ? $args['fields'] : 'all';
+	if ( ! empty( $args['orderby'] ) && in_array( $args['orderby'], array( 'name_num', 'parent' ) ) ) {
+		$fields  = isset( $args['fields'] ) ? $args['fields'] : 'all';
+		$orderby = $args['orderby'];
 
 		// Unset for wp_get_post_terms
 		unset( $args['orderby'] );
@@ -41,7 +45,14 @@ function wc_get_product_terms( $product_id, $taxonomy, $args = array() ) {
 
 		$terms = wp_get_post_terms( $product_id, $taxonomy, $args );
 
-		usort( $terms, '_wc_get_product_terms_parent_usort_callback' );
+		switch ( $orderby ) {
+			case 'name_num' :
+				usort( $terms, '_wc_get_product_terms_name_num_usort_callback' );
+			break;
+			case 'parent' :
+				usort( $terms, '_wc_get_product_terms_parent_usort_callback' );
+			break;
+		}
 
 		switch ( $fields ) {
 			case 'names' :
@@ -54,56 +65,88 @@ function wc_get_product_terms( $product_id, $taxonomy, $args = array() ) {
 				$terms = wp_list_pluck( $terms, 'slug' );
 				break;
 		}
+	} elseif ( ! empty( $args['orderby'] ) && $args['orderby'] === 'menu_order' ) {
+		// wp_get_post_terms doesn't let us use custom sort order
+		$args['include'] = wp_get_post_terms( $product_id, $taxonomy, array( 'fields' => 'ids' ) );
+
+		if ( empty( $args['include'] ) ) {
+			$terms = array();
+		} else {
+			// This isn't needed for get_terms
+			unset( $args['orderby'] );
+
+			// Set args for get_terms
+			$args['menu_order'] = isset( $args['order'] ) ? $args['order'] : 'ASC';
+			$args['hide_empty'] = isset( $args['hide_empty'] ) ? $args['hide_empty'] : 0;
+			$args['fields']     = isset( $args['fields'] ) ? $args['fields'] : 'names';
+
+			// Ensure slugs is valid for get_terms - slugs isn't supported
+			$args['fields']     = $args['fields'] === 'slugs' ? 'id=>slug' : $args['fields'];
+			$terms              = get_terms( $taxonomy, $args );
+		}
 	} else {
 		$terms = wp_get_post_terms( $product_id, $taxonomy, $args );
 	}
 
-	return $terms;
+	return apply_filters( 'woocommerce_get_product_terms' , $terms, $product_id, $taxonomy, $args );
 }
 
+
 /**
- * Sort by parent
+ * Sort by name (numeric).
+ * @param  WP_POST object $a
+ * @param  WP_POST object $b
+ * @return int
+ */
+function _wc_get_product_terms_name_num_usort_callback( $a, $b ) {
+	if ( $a->name + 0 === $b->name + 0 ) {
+		return 0;
+	}
+	return ( $a->name + 0 < $b->name + 0 ) ? -1 : 1;
+}
+/**
+ * Sort by parent.
  * @param  WP_POST object $a
  * @param  WP_POST object $b
  * @return int
  */
 function _wc_get_product_terms_parent_usort_callback( $a, $b ) {
-	if( $a->parent === $b->parent )
+	if ( $a->parent === $b->parent ) {
 		return 0;
+	}
 	return ( $a->parent < $b->parent ) ? 1 : -1;
 }
 
 /**
- * WooCommerce Dropdown categories
+ * WooCommerce Dropdown categories.
  *
- * Stuck with this until a fix for http://core.trac.wordpress.org/ticket/13258
- * We use a custom walker, just like WordPress does
+ * Stuck with this until a fix for http://core.trac.wordpress.org/ticket/13258.
+ * We use a custom walker, just like WordPress does.
  *
- * @param int $show_counts (default: 1)
- * @param int $hierarchical (default: 1)
- * @param int $show_uncategorized (default: 1)
+ * @param int $deprecated_show_uncategorized (default: 1)
  * @return string
  */
 function wc_product_dropdown_categories( $args = array(), $deprecated_hierarchical = 1, $deprecated_show_uncategorized = 1, $deprecated_orderby = '' ) {
-	global $wp_query, $woocommerce;
+	global $wp_query;
 
 	if ( ! is_array( $args ) ) {
 		_deprecated_argument( 'wc_product_dropdown_categories()', '2.1', 'show_counts, hierarchical, show_uncategorized and orderby arguments are invalid - pass a single array of values instead.' );
 
-		$args['show_counts']        = $args;
+		$args['show_count']         = $args;
 		$args['hierarchical']       = $deprecated_hierarchical;
 		$args['show_uncategorized'] = $deprecated_show_uncategorized;
 		$args['orderby']            = $deprecated_orderby;
 	}
 
-	$defaults = array(
+	$current_product_cat = isset( $wp_query->query['product_cat'] ) ? $wp_query->query['product_cat'] : '';
+	$defaults            = array(
 		'pad_counts'         => 1,
-		'show_counts'        => 1,
+		'show_count'         => 1,
 		'hierarchical'       => 1,
 		'hide_empty'         => 1,
 		'show_uncategorized' => 1,
 		'orderby'            => 'name',
-		'selected'           => isset( $wp_query->query['product_cat'] ) ? $wp_query->query['product_cat'] : '',
+		'selected'           => $current_product_cat,
 		'menu_order'         => false
 	);
 
@@ -114,19 +157,19 @@ function wc_product_dropdown_categories( $args = array(), $deprecated_hierarchic
 		$args['orderby']    = 'name';
 	}
 
-	$terms = get_terms( 'product_cat', $args );
+	$terms = get_terms( 'product_cat', apply_filters( 'wc_product_dropdown_categories_get_terms_args', $args ) );
 
-	if ( ! $terms )
+	if ( ! $terms ) {
 		return;
+	}
 
-	$output  = "<select name='product_cat' id='dropdown_product_cat'>";
-	$output .= '<option value="" ' .  selected( isset( $_GET['product_cat'] ) ? $_GET['product_cat'] : '', '', false ) . '>' . __( 'Select a category', 'woocommerce' ) . '</option>';
+	$output  = "<select name='product_cat' class='dropdown_product_cat'>";
+	$output .= '<option value="" ' .  selected( $current_product_cat, '', false ) . '>' . __( 'Select a category', 'woocommerce' ) . '</option>';
 	$output .= wc_walk_category_dropdown_tree( $terms, 0, $args );
-
-	if ( $args['show_uncategorized'] )
-		$output .= '<option value="0" ' . selected( isset( $_GET['product_cat'] ) ? $_GET['product_cat'] : '', '0', false ) . '>' . __( 'Uncategorized', 'woocommerce' ) . '</option>';
-
-	$output .="</select>";
+	if ( $args['show_uncategorized'] ) {
+		$output .= '<option value="0" ' . selected( $current_product_cat, '0', false ) . '>' . __( 'Uncategorized', 'woocommerce' ) . '</option>';
+	}
+	$output .= "</select>";
 
 	echo $output;
 }
@@ -137,26 +180,24 @@ function wc_product_dropdown_categories( $args = array(), $deprecated_hierarchic
  * @return mixed
  */
 function wc_walk_category_dropdown_tree() {
-	global $woocommerce;
-
-	if ( ! class_exists( 'WC_Product_Cat_Dropdown_Walker' ) )
+	if ( ! class_exists( 'WC_Product_Cat_Dropdown_Walker' ) ) {
 		include_once( WC()->plugin_path() . '/includes/walkers/class-product-cat-dropdown-walker.php' );
+	}
 
 	$args = func_get_args();
 
 	// the user's options are the third parameter
-	if ( empty( $args[2]['walker']) || !is_a($args[2]['walker'], 'Walker' ) )
+	if ( empty( $args[2]['walker']) || !is_a($args[2]['walker'], 'Walker' ) ) {
 		$walker = new WC_Product_Cat_Dropdown_Walker;
-	else
+	} else {
 		$walker = $args[2]['walker'];
+	}
 
-	return call_user_func_array(array( &$walker, 'walk' ), $args );
+	return call_user_func_array( array( &$walker, 'walk' ), $args );
 }
 
 /**
- * WooCommerce Term/Order item Meta API - set table name
- *
- * @return void
+ * WooCommerce Term/Order item Meta API - set table name.
  */
 function wc_taxonomy_metadata_wpdbfix() {
 	global $wpdb;
@@ -173,10 +214,40 @@ add_action( 'init', 'wc_taxonomy_metadata_wpdbfix', 0 );
 add_action( 'switch_blog', 'wc_taxonomy_metadata_wpdbfix', 0 );
 
 /**
- * WooCommerce Term Meta API - Update term meta
+ * When a term is split, ensure meta data maintained.
+ * @param  int $old_term_id
+ * @param  int $new_term_id
+ * @param  string $term_taxonomy_id
+ * @param  string $taxonomy
+ */
+function wc_taxonomy_metadata_update_content_for_split_terms( $old_term_id, $new_term_id, $term_taxonomy_id, $taxonomy ) {
+	global $wpdb;
+
+	if ( 'product_cat' === $taxonomy || taxonomy_is_product_attribute( $taxonomy ) ) {
+		$old_meta_data = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM {$wpdb->prefix}woocommerce_termmeta WHERE woocommerce_term_id = %d;", $old_term_id ) );
+
+		// Copy across to split term
+		if ( $old_meta_data ) {
+			foreach ( $old_meta_data as $meta_data ) {
+				$wpdb->insert(
+					"{$wpdb->prefix}woocommerce_termmeta",
+					array(
+						'woocommerce_term_id' => $new_term_id,
+						'meta_key'            => $meta_data->meta_key,
+						'meta_value'          => $meta_data->meta_value
+					)
+				);
+			}
+		}
+	}
+}
+add_action( 'split_shared_term', 'wc_taxonomy_metadata_update_content_for_split_terms', 10, 4 );
+
+/**
+ * WooCommerce Term Meta API - Update term meta.
  *
  * @param mixed $term_id
- * @param mixed $meta_key
+ * @param string $meta_key
  * @param mixed $meta_value
  * @param string $prev_value (default: '')
  * @return bool
@@ -186,7 +257,7 @@ function update_woocommerce_term_meta( $term_id, $meta_key, $meta_value, $prev_v
 }
 
 /**
- * WooCommerce Term Meta API - Add term meta
+ * WooCommerce Term Meta API - Add term meta.
  *
  * @param mixed $term_id
  * @param mixed $meta_key
@@ -199,7 +270,7 @@ function add_woocommerce_term_meta( $term_id, $meta_key, $meta_value, $unique = 
 }
 
 /**
- * WooCommerce Term Meta API - Delete term meta
+ * WooCommerce Term Meta API - Delete term meta.
  *
  * @param mixed $term_id
  * @param mixed $meta_key
@@ -212,10 +283,10 @@ function delete_woocommerce_term_meta( $term_id, $meta_key, $meta_value = '', $d
 }
 
 /**
- * WooCommerce Term Meta API - Get term meta
+ * WooCommerce Term Meta API - Get term meta.
  *
  * @param mixed $term_id
- * @param mixed $key
+ * @param string $key
  * @param bool $single (default: true)
  * @return mixed
  */
@@ -224,7 +295,7 @@ function get_woocommerce_term_meta( $term_id, $key, $single = true ) {
 }
 
 /**
- * Move a term before the a	given element of its hierarchy level
+ * Move a term before the a	given element of its hierarchy level.
  *
  * @param int $the_term
  * @param int $next_id the id of the next sibling element in save hierarchy level
@@ -273,7 +344,7 @@ function wc_reorder_terms( $the_term, $next_id, $taxonomy, $index = 0, $terms = 
 }
 
 /**
- * Set the sort order of a term
+ * Set the sort order of a term.
  *
  * @param int $term_id
  * @param int $index
@@ -309,12 +380,12 @@ function wc_set_term_order( $term_id, $index, $taxonomy, $recursive = false ) {
 }
 
 /**
- * Add term ordering to get_terms
+ * Add term ordering to get_terms.
  *
  * It enables the support a 'menu_order' parameter to get_terms for the product_cat taxonomy.
- * By default it is 'ASC'. It accepts 'DESC' too
+ * By default it is 'ASC'. It accepts 'DESC' too.
  *
- * To disable it, set it ot false (or 0)
+ * To disable it, set it ot false (or 0).
  *
  * @param array $clauses
  * @param array $taxonomies
@@ -322,7 +393,7 @@ function wc_set_term_order( $term_id, $index, $taxonomy, $recursive = false ) {
  * @return array
  */
 function wc_terms_clauses( $clauses, $taxonomies, $args ) {
-	global $wpdb, $woocommerce;
+	global $wpdb;
 
 	// No sorting when menu_order is false
 	if ( isset( $args['menu_order'] ) && $args['menu_order'] == false ) {
@@ -385,11 +456,11 @@ add_filter( 'terms_clauses', 'wc_terms_clauses', 10, 3 );
 
 /**
  * Function for recounting product terms, ignoring hidden products.
+ *
  * @param  array  $terms
  * @param  string  $taxonomy
  * @param  boolean $callback
  * @param  boolean $terms_are_term_taxonomy_ids
- * @return void
  */
 function _wc_term_recount( $terms, $taxonomy, $callback = true, $terms_are_term_taxonomy_ids = true ) {
 	global $wpdb;
@@ -475,22 +546,27 @@ function _wc_term_recount( $terms, $taxonomy, $callback = true, $terms_are_term_
 		// Update the count
 		update_woocommerce_term_meta( $term_id, 'product_count_' . $taxonomy->name, absint( $count ) );
 	}
+
+	delete_transient( 'wc_term_counts' );
 }
 
 /**
- * Recount terms after the stock amount changes
- * @param  int $product_id 
- * @return void
+ * Recount terms after the stock amount changes.
+ *
+ * @param int $product_id
  */
 function wc_recount_after_stock_change( $product_id ) {
-	if ( get_option( 'woocommerce_hide_out_of_stock_items' ) != 'yes' ) 
+	if ( get_option( 'woocommerce_hide_out_of_stock_items' ) != 'yes' )
 		return;
 
 	$product_terms = get_the_terms( $product_id, 'product_cat' );
 
 	if ( $product_terms ) {
-		foreach ( $product_terms as $term )
+		$product_cats = array();
+
+		foreach ( $product_terms as $term ) {
 			$product_cats[ $term->term_id ] = $term->parent;
+		}
 
 		_wc_term_recount( $product_cats, get_taxonomy( 'product_cat' ), false, false );
 	}
@@ -498,8 +574,11 @@ function wc_recount_after_stock_change( $product_id ) {
 	$product_terms = get_the_terms( $product_id, 'product_tag' );
 
 	if ( $product_terms ) {
-		foreach ( $product_terms as $term )
+		$product_tags = array();
+
+		foreach ( $product_terms as $term ) {
 			$product_tags[ $term->term_id ] = $term->parent;
+		}
 
 		_wc_term_recount( $product_tags, get_taxonomy( 'product_tag' ), false, false );
 	}
@@ -508,15 +587,14 @@ add_action( 'woocommerce_product_set_stock_status', 'wc_recount_after_stock_chan
 
 
 /**
- * Overrides the original term count for product categories and tags with the product count
+ * Overrides the original term count for product categories and tags with the product count.
  * that takes catalog visibility into account.
  *
  * @param array $terms
- * @param mixed $taxonomies
- * @param mixed $args
+ * @param string|array $taxonomies
  * @return array
  */
-function wc_change_term_counts( $terms, $taxonomies, $args ) {
+function wc_change_term_counts( $terms, $taxonomies ) {
 	if ( is_admin() || is_ajax() ) {
 		return $terms;
 	}
@@ -539,9 +617,49 @@ function wc_change_term_counts( $terms, $taxonomies, $args ) {
 
 	// Update transient
 	if ( $term_counts != $o_term_counts ) {
-		set_transient( 'wc_term_counts', $term_counts, YEAR_IN_SECONDS );
+		set_transient( 'wc_term_counts', $term_counts, DAY_IN_SECONDS * 30 );
 	}
 
 	return $terms;
 }
-add_filter( 'get_terms', 'wc_change_term_counts', 10, 3 );
+add_filter( 'get_terms', 'wc_change_term_counts', 10, 2 );
+
+/**
+ * Return products in a given term, and cache value.
+ *
+ * To keep in sync, product_count will be cleared on "set_object_terms".
+ *
+ * @param int $term_id
+ * @param string $taxonomy
+ * @return array
+ */
+function wc_get_term_product_ids( $term_id, $taxonomy ) {
+	$product_ids = get_woocommerce_term_meta( $term_id, 'product_ids', true );
+
+	if ( false === $product_ids || ! is_array( $product_ids ) ) {
+		$product_ids = get_objects_in_term( $term_id, $taxonomy );
+		update_woocommerce_term_meta( $term_id, 'product_ids', $product_ids );
+	}
+
+	return $product_ids;
+}
+
+/**
+ * When a post is updated and terms recounted (called by _update_post_term_count), clear the ids.
+ * @param int $term_id
+ * @param int    $object_id  Object ID.
+ * @param array  $terms      An array of object terms.
+ * @param array  $tt_ids     An array of term taxonomy IDs.
+ * @param string $taxonomy   Taxonomy slug.
+ * @param bool   $append     Whether to append new terms to the old terms.
+ * @param array  $old_tt_ids Old array of term taxonomy IDs.
+ */
+function wc_clear_term_product_ids( $object_id, $terms, $tt_ids, $taxonomy, $append, $old_tt_ids ) {
+	foreach ( $old_tt_ids as $term_id ) {
+		delete_woocommerce_term_meta( $term_id, 'product_ids' );
+	}
+	foreach ( $tt_ids as $term_id ) {
+		delete_woocommerce_term_meta( $term_id, 'product_ids' );
+	}
+}
+add_action( 'set_object_terms', 'wc_clear_term_product_ids', 10, 6 );
